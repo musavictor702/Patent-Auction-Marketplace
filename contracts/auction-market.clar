@@ -16,6 +16,7 @@
 (define-constant err-not-bidder (err u107))
 (define-constant err-auction-not-ended (err u108))
 (define-constant err-already-claimed (err u109))
+(define-constant err-invalid-input (err u110))
 
 (define-data-var next-auction-id uint u1)
 
@@ -239,5 +240,96 @@
     (map-delete bids { auction-id: auction-id, bidder: tx-sender })
     
     (ok true)
+  )
+)
+
+
+(define-constant time-extension  u100)
+(define-constant extension-threshold  u10)
+
+(define-public (place-bid-with-extension (auction-id uint) (bid-amount uint))
+  (let
+    (
+      (auction (unwrap! (map-get? auctions { auction-id: auction-id }) err-not-found))
+      (current-highest-bid (get highest-bid auction))
+      (min-bid (if (> current-highest-bid u0)
+                  (+ current-highest-bid u1)
+                  (get reserve-price auction)))
+      (blocks-remaining (- (get end-block auction) stacks-block-height))
+    )
+    (asserts! (is-auction-active auction-id) err-auction-not-active)
+    (asserts! (>= bid-amount min-bid) err-bid-too-low)
+    
+    (map-set bids
+      { auction-id: auction-id, bidder: tx-sender }
+      { amount: bid-amount }
+    )
+    
+    (map-set auctions
+      { auction-id: auction-id }
+      (merge auction {
+        highest-bid: bid-amount,
+        highest-bidder: (some tx-sender),
+        end-block: (if (<= blocks-remaining extension-threshold)
+                      (+ (get end-block auction) time-extension)
+                      (get end-block auction))
+      })
+    )
+    
+    (ok bid-amount)
+  )
+)
+
+
+(define-public (create-multiple-auctions 
+    (patent-ids (list 10 (string-ascii 64)))
+    (descriptions (list 10 (string-utf8 500)))
+    (durations (list 10 uint))
+    (reserve-prices (list 10 uint)))
+  (let
+    (
+      (auction-count (len patent-ids))
+    )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (is-eq auction-count (len descriptions)) err-invalid-input)
+    (asserts! (is-eq auction-count (len durations)) err-invalid-input)
+    (asserts! (is-eq auction-count (len reserve-prices)) err-invalid-input)
+    
+    (ok (map create-single-auction patent-ids descriptions durations reserve-prices))
+  )
+)
+
+(define-private (create-single-auction 
+    (patent-id (string-ascii 64))
+    (description (string-utf8 500))
+    (duration uint)
+    (reserve-price uint))
+  (let
+    (
+      (auction-id (var-get next-auction-id))
+      (start-block stacks-block-height)
+      (end-block (+ stacks-block-height duration))
+    )
+    (map-set auctions
+      { auction-id: auction-id }
+      {
+        patent-id: patent-id,
+        creator: tx-sender,
+        description: description,
+        start-block: start-block,
+        end-block: end-block,
+        reserve-price: reserve-price,
+        highest-bid: u0,
+        highest-bidder: none,
+        status: "active",
+        claimed: false
+      }
+    )
+    (map-set patent-owners
+      { patent-id: patent-id }
+      { owner: contract-owner }
+    )
+    (var-set next-auction-id (+ auction-id u1))
+    auction-id
   )
 )
