@@ -1,5 +1,8 @@
 (define-constant err-invalid-range (err u200))
 (define-constant err-invalid-page (err u201))
+(define-constant err-watchlist-full (err u202))
+(define-constant err-not-in-watchlist (err u203))
+(define-constant err-already-in-watchlist (err u204))
 
 ;; Helper function to get the minimum of two uints
 (define-read-only (min (a uint) (b uint))
@@ -16,6 +19,21 @@
 (define-map status-counts
   { status: (string-ascii 20) }
   { count: uint }
+)
+
+(define-map user-watchlist
+  { user: principal, index: uint }
+  { auction-id: uint }
+)
+
+(define-map watchlist-counts
+  { user: principal }
+  { count: uint }
+)
+
+(define-map auction-cache
+  { auction-id: uint }
+  { highest-bid: uint, status: (string-ascii 20) }
 )
 
 (define-read-only (search-auctions-by-status (status (string-ascii 20)) (page uint) (per-page uint))
@@ -93,17 +111,18 @@
   (acc { min-price: uint, max-price: uint, results: (list 100 uint), count: uint, max-count: uint }))
   (if (>= (get count acc) (get max-count acc))
     acc
-    (match (contract-call? .auction-market get-auction auction-id)
-      auction-data
-        (if (and (>= (get highest-bid auction-data) (get min-price acc))
-                 (<= (get highest-bid auction-data) (get max-price acc)))
-          (merge acc { 
-            results: (unwrap-panic (as-max-len? (append (get results acc) auction-id) u100)),
-            count: (+ (get count acc) u1)
-          })
-          acc)
-      err
-        acc))
+    (let
+      (
+        (auction-data (map-get? auction-cache { auction-id: auction-id }))
+      )
+      (if (and (is-some auction-data) 
+               (>= (get highest-bid (unwrap-panic auction-data)) (get min-price acc))
+               (<= (get highest-bid (unwrap-panic auction-data)) (get max-price acc)))
+        (merge acc { 
+          results: (unwrap-panic (as-max-len? (append (get results acc) auction-id) u100)),
+          count: (+ (get count acc) u1)
+        })
+        acc)))
 )
 
 
@@ -159,11 +178,12 @@
   )
 )
 
-(define-public (register-new-auction (auction-id uint))
+(define-public (register-auction (auction-id uint))
   (let
     (
       (active-count (default-to u0 (get count (map-get? status-counts { status: "active" }))))
     )
+    (asserts! (> auction-id u0) err-invalid-range)
     (map-set auction-by-status
       { status: "active", index: active-count }
       { auction-id: auction-id })
@@ -172,9 +192,140 @@
       { status: "active" }
       { count: (+ active-count u1) })
     
+    (map-set auction-cache
+      { auction-id: auction-id }
+      { highest-bid: u0, status: "active" })
+    
     (var-set total-auctions-created (+ (var-get total-auctions-created) u1))
     
     (ok true)
   )
+)
+
+(define-public (update-auction-cache (auction-id uint) (highest-bid uint) (status (string-ascii 20)))
+  (begin
+    (map-set auction-cache
+      { auction-id: auction-id }
+      { highest-bid: highest-bid, status: status })
+    (ok true)
+  )
+)
+
+(define-public (watchlist-auction (auction-id uint))
+  (let
+    (
+      (user-count (default-to u0 (get count (map-get? watchlist-counts { user: tx-sender }))))
+    )
+    (asserts! (< user-count u50) err-watchlist-full)
+    (asserts! (is-none (map-get? user-watchlist { user: tx-sender, index: user-count })) err-already-in-watchlist)
+    
+    (map-set user-watchlist
+      { user: tx-sender, index: user-count }
+      { auction-id: auction-id })
+    
+    (map-set watchlist-counts
+      { user: tx-sender }
+      { count: (+ user-count u1) })
+    
+    (ok true)
+  )
+)
+
+(define-public (remove-from-watchlist (auction-id uint))
+  (let
+    (
+      (user-count (default-to u0 (get count (map-get? watchlist-counts { user: tx-sender }))))
+      (auction-index (find-auction-in-watchlist tx-sender auction-id u0 user-count))
+    )
+    (asserts! (is-some auction-index) err-not-in-watchlist)
+    
+    (let
+      (
+        (index-to-remove (unwrap-panic auction-index))
+        (last-index (- user-count u1))
+      )
+      (if (< index-to-remove last-index)
+        (let
+          (
+            (last-auction (unwrap-panic (get auction-id (map-get? user-watchlist { user: tx-sender, index: last-index }))))
+          )
+          (map-set user-watchlist
+            { user: tx-sender, index: index-to-remove }
+            { auction-id: last-auction })
+        )
+        true
+      )
+      
+      (map-delete user-watchlist { user: tx-sender, index: last-index })
+      (map-set watchlist-counts
+        { user: tx-sender }
+        { count: last-index })
+      
+      (ok true)
+    )
+  )
+)
+
+(define-read-only (get-user-watchlist (user principal) (page uint) (per-page uint))
+  (let
+    (
+      (start-index (* page per-page))
+      (end-index (+ start-index per-page))
+      (user-count (default-to u0 (get count (map-get? watchlist-counts { user: user }))))
+    )
+    (asserts! (<= per-page u50) err-invalid-range)
+    (asserts! (< start-index user-count) err-invalid-page)
+    (ok (get-watchlist-range user start-index (min end-index user-count)))
+  )
+)
+
+(define-read-only (get-watchlist-count (user principal))
+  (ok (default-to u0 (get count (map-get? watchlist-counts { user: user }))))
+)
+
+(define-read-only (is-auction-watchlisted (user principal) (auction-id uint))
+  (let
+    (
+      (user-count (default-to u0 (get count (map-get? watchlist-counts { user: user }))))
+    )
+    (ok (is-some (find-auction-in-watchlist user auction-id u0 user-count)))
+  )
+)
+
+(define-private (find-auction-in-watchlist (user principal) (auction-id uint) (start-index uint) (end-index uint))
+  (get found-index (fold find-auction-helper
+    (generate-range start-index end-index)
+    { user: user, target-id: auction-id, found-index: none }))
+)
+
+(define-private (find-auction-helper (index uint) (acc { user: principal, target-id: uint, found-index: (optional uint) }))
+  (if (is-some (get found-index acc))
+    acc
+    (let
+      (
+        (watchlist-entry (map-get? user-watchlist { user: (get user acc), index: index }))
+      )
+      (if (and (is-some watchlist-entry) (is-eq (get auction-id (unwrap-panic watchlist-entry)) (get target-id acc)))
+        (merge acc { found-index: (some index) })
+        acc
+      )
+    )
+  )
+)
+
+(define-private (get-watchlist-range (user principal) (start uint) (end uint))
+  (map get-watchlist-auction-id
+    (generate-range start end)
+    (list user user user user user user user user user user
+          user user user user user user user user user user
+          user user user user user user user user user user
+          user user user user user user user user user user
+          user user user user user user user user user user))
+)
+
+(define-private (get-watchlist-auction-id (index uint) (user principal))
+  (default-to u0 
+    (get auction-id 
+      (map-get? user-watchlist { user: user, index: index })))
 )
 

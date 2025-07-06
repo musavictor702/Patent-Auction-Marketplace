@@ -89,41 +89,7 @@
   (var-get next-auction-id)
 )
 
-(define-public (create-auction 
-    (patent-id (string-ascii 64))
-    (description (string-utf8 500))
-    (duration uint)
-    (reserve-price uint))
-  (let
-    (
-      (auction-id (var-get next-auction-id))
-      (start-block stacks-block-height)
-      (end-block (+ stacks-block-height duration))
-    )
-    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
-    (map-set auctions
-      { auction-id: auction-id }
-      {
-        patent-id: patent-id,
-        creator: tx-sender,
-        description: description,
-        start-block: start-block,
-        end-block: end-block,
-        reserve-price: reserve-price,
-        highest-bid: u0,
-        highest-bidder: none,
-        status: "active",
-        claimed: false
-      }
-    )
-    (map-set patent-owners
-      { patent-id: patent-id }
-      { owner: contract-owner }
-    )
-    (var-set next-auction-id (+ auction-id u1))
-    (ok auction-id)
-  )
-)
+
 
 (define-public (place-bid (auction-id uint) (bid-amount uint))
   (let
